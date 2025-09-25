@@ -116,7 +116,7 @@ dependencies:
 # Snakefile
 This is the trickiest part of the entire project. 
 Please note that the `Snakefile` I share here may not be the best/optimal, it just works. 
-```Snakefile
+```python
 configfile: "config/config_small.yaml"
 SAMPLES = config["samples"]
 REF     = config["reference"]
@@ -124,27 +124,8 @@ REF     = config["reference"]
 rule all:
     input:
         expand("results/variants/{sample}.vcf.gz", sample=SAMPLES),
-        expand("results/variants/{sample}.vcf.gz.tbi", sample=SAMPLES)
+        expand("results/variants/{sample}.vcf.gz.tbi", sample=SAMPLES),
 
-#########################################################
-# 1. QUALITY CONTROL
-#########################################################
-rule fastqc_raw:
-    input:
-        r1 = "data/{sample}.1.fq.gz",
-        r2 = "data/{sample}.2.fq.gz"
-    output:
-        html1 = "results/fastqc_raw/{sample}_1.html",
-        zip1  = "results/fastqc_raw/{sample}_1_fastqc.zip",
-        html2 = "results/fastqc_raw/{sample}_2.html",
-        zip2  = "results/fastqc_raw/{sample}_2_fastqc.zip"
-    log:
-        "logs/fastqc/{sample}.log"
-    threads: 1
-    conda:
-        "envs/fastqc.yaml"
-    wrapper:
-        "v5.7.0/bio/fastqc"
 
 #########################################################
 # 2. ADAPTER/TRIM
@@ -167,35 +148,19 @@ rule trim_galore_pe:
     wrapper:
         "v7.1.0/bio/trim_galore/pe"
 
-#########################################################
-# 2a. QUALITY CONTROL AFTER TRIMMING
-#########################################################
-
-rule fastqc_trimmed: 
-    input:
-        r1 = "results/trimmed/{sample}_val_1.fq.gz",
-        r2 = "results/trimmed/{sample}_val_2.fq.gz"
-    output:
-        html1 = "results/fastqc_trimmed/{sample}_val_1.html",
-        zip1  = "results/fastqc_trimmed/{sample}_val_1_fastqc.zip",
-        html2 = "results/fastqc_trimmed/{sample}_val_2.html",
-        zip2  = "results/fastqc_trimmed/{sample}_val_2_fastqc.zip"
-    log:
-        "logs/fastqc_trimmed/{sample}.log"
-    threads: 1
-    conda:
-        "envs/fastqc.yaml"
-    wrapper:
-        "v5.7.0/bio/fastqc"
 
 #########################################################
 # 3. BUILD REFERENCE INDEX
 #########################################################
-rule bwa_index: 
+rule bwa_index:
     input:
         ref = REF
     output:
-        touch(REF + ".bwa.indexed") # Different from own run indexed file
+        REF + ".amb",
+        REF + ".ann",
+        REF + ".bwt",
+        REF + ".pac",
+        REF + ".sa"
     log:
         "logs/bwa/index.log"
     threads: 2
@@ -203,8 +168,11 @@ rule bwa_index:
         "envs/bwa.yaml"
     shell:
         """
-        bwa index {input.ref} 2> {log}
-        """    
+        bwa index -a bwtsw \
+            -p {input.ref} \
+            {input.ref} \
+        2> {log}
+        """
 
 rule samtools_faidx:
     input:
@@ -228,57 +196,100 @@ rule bwa_mem:
     input:
         reads = ["results/trimmed/{sample}_val_1.fq.gz",
                  "results/trimmed/{sample}_val_2.fq.gz"],
-        ref = REF,         
-        idx = REF + ".bwa.indexed"
+        ref = REF,
+        idx = multiext(REF, ".amb", ".ann", ".bwt", ".pac", ".sa")
     output:
         "results/aligned/{sample}.bam"
     log:
         "logs/bwa/mem/{sample}.log"
     threads: 8
     params:
-        extra      = r"-R '@RG\tID:{sample}\tSM:{sample}'",
-        sorting    = "samtools",
+        # ensure the RG line is expanded per-sample
+        extra = lambda wildcards: f"-R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA'",
+        sorting = "samtools",
         sort_order = "coordinate"
     conda:
         "envs/bwa.yaml"
     wrapper:
         "v1.0.0/bio/bwa/mem"
 
-rule samtools_index:
+#########################################################
+# 4b. MARK DUPLICATES (important for eukaryotic genomes)
+#########################################################
+rule mark_duplicates_samtools:
     input:
-        "results/aligned/{sample}.bam"
+        bam = "results/aligned/{sample}.bam"
     output:
-        "results/aligned/{sample}.bam.bai"
+        dedup_bam = "results/aligned/{sample}.dedup.bam",
+        dedup_bai = "results/aligned/{sample}.dedup.bam.bai"
     log:
-        "logs/samtools/index/{sample}.log"
+        "logs/samtools/markdup/{sample}.log"
+    threads: 4
+    conda:
+        "envs/samtools.yaml"
+    shell:
+        r"""
+        set -o pipefail
+        # name-sort -> fixmate -> coord-sort -> markdup -> index
+        samtools sort -n -@ {threads} {input.bam} -T results/aligned/{wildcards.sample}.ns -o results/aligned/{wildcards.sample}.name_sorted.bam 2>> {log}
+        samtools fixmate -m results/aligned/{wildcards.sample}.name_sorted.bam results/aligned/{wildcards.sample}.fixmate.bam 2>> {log}
+        samtools sort -@ {threads} results/aligned/{wildcards.sample}.fixmate.bam -T results/aligned/{wildcards.sample}.cs -o results/aligned/{wildcards.sample}.pos_sorted.bam 2>> {log}
+        samtools markdup -r results/aligned/{wildcards.sample}.pos_sorted.bam {output.dedup_bam} 2>> {log}
+        samtools index -@ {threads} {output.dedup_bam} 2>> {log}
+        # optional cleanup of intermediates
+        rm -f results/aligned/{wildcards.sample}.name_sorted.bam results/aligned/{wildcards.sample}.fixmate.bam results/aligned/{wildcards.sample}.pos_sorted.bam
+        """
+
+#########################################################
+# 5a. MEAN DEPTH (empirical measurement after deduplication)
+#########################################################
+rule samtools_mean_depth:
+    input:
+        bam = "results/aligned/{sample}.dedup.bam"
+    output:
+        mean_txt = "results/coverage/{sample}.mean_depth.txt"
+    log:
+        "logs/coverage/{sample}.log"
     threads: 2
     conda:
         "envs/samtools.yaml"
     shell:
+        r"""
+        # compute genome-wide mean depth (includes positions with depth 0)
+        samtools depth -a {input.bam} | awk '{{sum+=$3; cnt+=1}} END {{ if (cnt>0) printf("%.6f\n", sum/cnt); else print 0 }}' > {output.mean_txt} 2>> {log}
         """
-        samtools index -@ {threads} {input} 2> {log}
-        """ 
 
 #########################################################
-# 5. VARIANT CALLING
+# 5b. VARIANT CALLING (bcftools mpileup with dynamic --max-depth)
 #########################################################
 rule bcftools_mpileup:
     input:
         ref   = REF,
         faidx = REF + ".fai",
-        bam   = "results/aligned/{sample}.bam",
-        bai   = "results/aligned/{sample}.bam.bai"
+        bam   = "results/aligned/{sample}.dedup.bam",
+        bai   = "results/aligned/{sample}.dedup.bam.bai",
+        mean  = "results/coverage/{sample}.mean_depth.txt"
     output:
         pileup = "results/variants/{sample}.bcf"
     log:
         "logs/bcftools/mpileup/{sample}.log"
     threads: 4
-    params:
-        options = "--max-depth 100 --min-BQ 15"
     conda:
         "envs/bcftools.yaml"
-    wrapper:
-        "v6.1.0/bio/bcftools/mpileup"
+    shell:
+        r"""
+        set -o pipefail
+        mean=$(cat {input.mean} | tr -d '[:space:]')
+        # guard against empty/zero mean (failed sample)
+        if [ -z "$mean" ] || awk "BEGIN{{exit($mean<=0)}}"; then
+            mean=0
+        fi
+        # compute max-depth = max(100, int(mean * 5))
+        maxd=$(awk -v m="$mean" 'BEGIN {{ md = int(m*5); if (md < 100) md = 100; print md }}')
+        echo "Sample {wildcards.sample} mean_depth=$mean, using --max-depth=$maxd" >> {log}
+        # use mapping quality filter (-q) and base quality (-Q). Output compressed BCF.
+        bcftools mpileup -f {input.ref} -q 20 -Q 15 --max-depth $maxd -Ob -o {output.pileup} {input.bam} 2>> {log}
+        """
 
 rule bcftools_call:
     input:
@@ -290,10 +301,11 @@ rule bcftools_call:
     params:
         caller = "-m",
         extra = "--ploidy 2 --prior 0.001"
+    threads: 2
     conda:
         "envs/bcftools.yaml"
     wrapper:
-        "v7.1.0/bio/bcftools/call"   
+        "v7.1.0/bio/bcftools/call"
 
 rule bcftools_index:
     input:
@@ -305,7 +317,7 @@ rule bcftools_index:
     conda:
         "envs/bcftools.yaml"
     shell:
-        "bcftools index --tbi {input} 2> {log}"   
+        "bcftools index --tbi {input} 2> {log}"  
 ```
 I recommend using `snakemake` wrapper as much as possible whenever available because they provide optimal reproducibility across platforms. 
 
