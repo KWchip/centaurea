@@ -117,23 +117,27 @@ dependencies:
 This is the trickiest part of the entire project. 
 Please note that the `Snakefile` I share here may not be the best/optimal, it just works. 
 ```Snakefile
-configfile: "config/config.yaml"
+configfile: "config/config_small.yaml"
 SAMPLES = config["samples"]
 REF     = config["reference"]
 
 rule all:
     input:
-        expand("results/variants/{sample}.vcf.gz", sample=SAMPLES)
+        expand("results/variants/{sample}.vcf.gz", sample=SAMPLES),
+        expand("results/variants/{sample}.vcf.gz.tbi", sample=SAMPLES)
 
-rule fastqc:
+#########################################################
+# 1. QUALITY CONTROL
+#########################################################
+rule fastqc_raw:
     input:
         r1 = "data/{sample}.1.fq.gz",
         r2 = "data/{sample}.2.fq.gz"
     output:
-        html1 = "results/fastqc/{sample}_1.html",
-        zip1  = "results/fastqc/{sample}_1_fastqc.zip",
-        html2 = "results/fastqc/{sample}_2.html",
-        zip2  = "results/fastqc/{sample}_2_fastqc.zip"
+        html1 = "results/fastqc_raw/{sample}_1.html",
+        zip1  = "results/fastqc_raw/{sample}_1_fastqc.zip",
+        html2 = "results/fastqc_raw/{sample}_2.html",
+        zip2  = "results/fastqc_raw/{sample}_2_fastqc.zip"
     log:
         "logs/fastqc/{sample}.log"
     threads: 1
@@ -142,6 +146,9 @@ rule fastqc:
     wrapper:
         "v5.7.0/bio/fastqc"
 
+#########################################################
+# 2. ADAPTER/TRIM
+#########################################################
 rule trim_galore_pe:
     input:
         ["data/{sample}.1.fq.gz", "data/{sample}.2.fq.gz"]
@@ -150,8 +157,6 @@ rule trim_galore_pe:
         report_fwd = "results/trimmed/reports/{sample}_R1_trimming_report.txt",
         fasta_rev = "results/trimmed/{sample}_val_2.fq.gz",
         report_rev = "results/trimmed/{sample}_R2_trimming_report.txt"
-        # r1_unpaired  = "results/trimmed/{sample}_unpaired_1.fq.gz",
-        # r2_unpaired  = "results/trimmed/{sample}_unpaired_2.fq.gz"
     log:
         "logs/trim_galore/{sample}.log"
     threads: 4
@@ -162,15 +167,35 @@ rule trim_galore_pe:
     wrapper:
         "v7.1.0/bio/trim_galore/pe"
 
-rule bwa_index:
+#########################################################
+# 2a. QUALITY CONTROL AFTER TRIMMING
+#########################################################
+
+rule fastqc_trimmed: 
+    input:
+        r1 = "results/trimmed/{sample}_val_1.fq.gz",
+        r2 = "results/trimmed/{sample}_val_2.fq.gz"
+    output:
+        html1 = "results/fastqc_trimmed/{sample}_val_1.html",
+        zip1  = "results/fastqc_trimmed/{sample}_val_1_fastqc.zip",
+        html2 = "results/fastqc_trimmed/{sample}_val_2.html",
+        zip2  = "results/fastqc_trimmed/{sample}_val_2_fastqc.zip"
+    log:
+        "logs/fastqc_trimmed/{sample}.log"
+    threads: 1
+    conda:
+        "envs/fastqc.yaml"
+    wrapper:
+        "v5.7.0/bio/fastqc"
+
+#########################################################
+# 3. BUILD REFERENCE INDEX
+#########################################################
+rule bwa_index: 
     input:
         ref = REF
     output:
-        REF + ".amb",
-        REF + ".ann",
-        REF + ".bwt",
-        REF + ".pac",
-        REF + ".sa"
+        touch(REF + ".bwa.indexed") # Different from own run indexed file
     log:
         "logs/bwa/index.log"
     threads: 2
@@ -178,17 +203,33 @@ rule bwa_index:
         "envs/bwa.yaml"
     shell:
         """
-        bwa index -a bwtsw \
-            -p {input.ref} \
-            {input.ref} \
-        2> {log}
+        bwa index {input.ref} 2> {log}
+        """    
+
+rule samtools_faidx:
+    input:
+        ref = REF
+    output:
+        REF + ".fai"
+    log:
+        "logs/samtools/faidx.log"
+    threads:1
+    conda:
+        "envs/samtools.yaml"
+    shell:
         """
-        
+        samtools faidx {input.ref} 2> {log}
+        """
+
+#########################################################
+# 4. ALIGNMENT
+#########################################################
 rule bwa_mem:
     input:
         reads = ["results/trimmed/{sample}_val_1.fq.gz",
                  "results/trimmed/{sample}_val_2.fq.gz"],
-        idx    = multiext(REF, ".amb", ".ann", ".bwt", ".pac", ".sa")
+        ref = REF,         
+        idx = REF + ".bwa.indexed"
     output:
         "results/aligned/{sample}.bam"
     log:
@@ -201,29 +242,32 @@ rule bwa_mem:
     conda:
         "envs/bwa.yaml"
     wrapper:
-        "v1.0.0/bio/bwa/mem" 
+        "v1.0.0/bio/bwa/mem"
 
-rule samtools_faidx:
+rule samtools_index:
     input:
-        ref = REF
+        "results/aligned/{sample}.bam"
     output:
-        REF + ".fai"
+        "results/aligned/{sample}.bam.bai"
     log:
-        "logs/samtools/faidx.log"
-    threads:1
-    conda: 
+        "logs/samtools/index/{sample}.log"
+    threads: 2
+    conda:
         "envs/samtools.yaml"
     shell:
         """
-        samtools faidx {input.ref} \
-        2> {log}
-        """
+        samtools index -@ {threads} {input} 2> {log}
+        """ 
 
+#########################################################
+# 5. VARIANT CALLING
+#########################################################
 rule bcftools_mpileup:
     input:
-        index = REF + ".fai",
         ref   = REF,
-        alignments   = "results/aligned/{sample}.bam"
+        faidx = REF + ".fai",
+        bam   = "results/aligned/{sample}.bam",
+        bai   = "results/aligned/{sample}.bam.bai"
     output:
         pileup = "results/variants/{sample}.bcf"
     log:
@@ -234,7 +278,7 @@ rule bcftools_mpileup:
     conda:
         "envs/bcftools.yaml"
     wrapper:
-        "v6.1.0/bio/bcftools/mpileup" 
+        "v6.1.0/bio/bcftools/mpileup"
 
 rule bcftools_call:
     input:
@@ -244,13 +288,24 @@ rule bcftools_call:
     log:
         "logs/bcftools/call/{sample}.log"
     params:
-        uncompressed_bcf = False,
         caller = "-m",
         extra = "--ploidy 1 --prior 0.001"
     conda:
         "envs/bcftools.yaml"
     wrapper:
         "v7.1.0/bio/bcftools/call"   
+
+rule bcftools_index:
+    input:
+        "results/variants/{sample}.vcf.gz"
+    output:
+        "results/variants/{sample}.vcf.gz.tbi"
+    log:
+        "logs/bcftools/index/{sample}.log"
+    conda:
+        "envs/bcftools.yaml"
+    shell:
+        "bcftools index --tbi {input} 2> {log}"   
 ```
 I recommend using `snakemake` wrapper as much as possible whenever available because they provide optimal reproducibility across platforms. 
 
