@@ -289,7 +289,7 @@ rule bcftools_call:
         "logs/bcftools/call/{sample}.log"
     params:
         caller = "-m",
-        extra = "--ploidy 1 --prior 0.001"
+        extra = "--ploidy 2 --prior 0.001"
     conda:
         "envs/bcftools.yaml"
     wrapper:
